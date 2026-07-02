@@ -1,141 +1,113 @@
 # -*- coding: UTF-8 -*- 
 
-import struct
 import zlib
 import hashlib
 import re
+import glob
 from subprocess import check_call
 import argparse
 import os
-from xml.dom.minidom import parse
-import xml.dom.minidom
 import zipfile
-from PIL import Image
 import shutil
 
+from axml_editor import AXML
 
-stApkToolPt = r'D:\Tools\ReverseTools\android\apktool_2.4.1.jar'
-stShellAppPt = r'.\shellApplicationSourceCode'
-staaptPt = r'D:\Android\Sdk\build-tools\29.0.3\aapt.exe'
-stAndroidJarlibPt = r'D:\Android\Sdk\platforms\android-29\android.jar'
-stdxJarPt = r'D:\Android\Sdk\build-tools\29.0.3\lib\dx.jar'
-stApksignJarPt = r'D:\Android\Sdk\build-tools\29.0.3\lib\apksigner.jar'
+# 工具路径可通过环境变量覆盖。
+# v3：不再使用 apktool / aapt（不反编译、不重编资源），因此只需 JDK 工具链：
+#   ANDROID_JAR(javac)、DX_JAR(dx)、APKSIGNER_JAR(签名)、ZIPALIGN(对齐)。
+stShellAppPt = os.environ.get('SHELL_APP_DIR', './shellApplicationSourceCode')
+stAndroidJarlibPt = os.environ.get('ANDROID_JAR', r'D:\Android\Sdk\platforms\android-29\android.jar')
+stdxJarPt = os.environ.get('DX_JAR', r'D:\Android\Sdk\build-tools\29.0.3\lib\dx.jar')
+stApksignJarPt = os.environ.get('APKSIGNER_JAR', r'D:\Android\Sdk\build-tools\29.0.3\lib\apksigner.jar')
+stZipalignPt = os.environ.get('ZIPALIGN', r'D:\Android\Sdk\build-tools\29.0.3\zipalign.exe')
 stCurrentPt = os.path.abspath(__file__).replace(os.path.basename(__file__), "")
 
+# 加密密钥，需与 Java 层 FileUtils.XOR_KEY / native 层一致
+INKEY = 0xFF
+# 隐藏 payload 容器魔数 "YYJG"，需与 FileUtils.PAYLOAD_MAGIC 一致
+PAYLOAD_MAGIC = 0x474A5959
+# 打包 so 的目标 ABI（有对应 lib/<abi>/*.so 才会写入）
+TARGET_ABIS = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
 
-def add_srcDexToShellDex(srcDex, shellDex):
 
-    liShellDt = []
-    liSrcDexDt = []
-    liAllDt = []
+def le32(n):
+    """int -> 4 字节小端 bytes"""
+    return bytes([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff])
 
-    #将原始DEX和壳DEX数据放在一个列表中
-    with open(shellDex, "rb") as f:
+
+def xor_encrypt(data, key=INKEY):
+    return bytes([b ^ key for b in data])
+
+
+def build_shell_dex_with_payloads(shellDexPath, srcDexBytesList):
+    """
+    将一个或多个原始 dex 加密后隐藏到壳 dex 尾部，容器格式如下（追加在壳 dex 之后）：
+
+        [magic(4,LE)] [count(4,LE)]
+        重复 count 次: [len_i(4,LE)] [XOR 加密的原始 dex_i]
+        [tailLen(4,LE)]  <- 文件最后 4 字节 = 从 magic 到最后一个 dex 的字节数
+
+    随后重算壳 dex 的 file_size / signature / checksum，使整个 classes.dex 仍是合法 dex。
+    需与 Java 层 FileUtils.extractPayloadDexes 完全一致。
+    """
+    with open(shellDexPath, "rb") as f:
         shellData = f.read()
-        liShellDt = list(struct.unpack(len(shellData)*'B', shellData))
-    with open(srcDex, 'rb') as f:
-        srcDt = f.read()
-        liSrcDexDt = list(struct.unpack(len(srcDt)*'B', srcDt))
-    liAllDt.extend(shellData)
-    # 加密原DEX
-    for i in liSrcDexDt:  
-        liAllDt.append(i ^ 0xff)
 
-    iSrcDexLen = len(liSrcDexDt)
-    liSrcDexLen = intToSmalEndian(iSrcDexLen)
-    liSrcDexLen.reverse()
-    # 加密原DEX长度
-    for i in liSrcDexLen:
-        liAllDt.append(i ^ 0xff)
+    out = bytearray(shellData)
 
-    # 计算合成后DEX文件的checksum、signature、file_size
-    # 更改文件头
-    newFsize = len(liAllDt)
-    liNewFSize = intToSmalEndian(newFsize)
-    for i in range(4):
-        liAllDt[32 + i] = liNewFSize[i]
+    # 容器区
+    payload = bytearray()
+    payload += le32(PAYLOAD_MAGIC)
+    payload += le32(len(srcDexBytesList))
+    for src in srcDexBytesList:
+        enc = xor_encrypt(src)
+        payload += le32(len(enc))
+        payload += enc
+    tail_len = len(payload)  # magic..最后一个 dex 的字节数
 
-    newSignature = hashlib.sha1(bytes(liAllDt[32:])).hexdigest()
-    liNewSignature = re.findall(r'.{2}', newSignature)
-    for i in range(len(liNewSignature)):
-        liNewSignature[i] = ord(bytes.fromhex(liNewSignature[i]))
-    for i in range(20):
-        liAllDt[12 + i] = liNewSignature[i]
+    out += payload
+    out += le32(tail_len)
 
-    newChecksum = zlib.adler32(bytes(liAllDt[12:]))
-    liNewChecksum = intToSmalEndian(newChecksum)
-    for i in range(4):
-        liAllDt[8 + i] = liNewChecksum[i]
-    
+    # 重算 dex 头，使壳 classes.dex 整体合法
+    new_fsize = len(out)
+    out[32:36] = le32(new_fsize)
+
+    new_sig = hashlib.sha1(bytes(out[32:])).digest()  # signature 覆盖 [32:]
+    out[12:32] = new_sig
+
+    new_checksum = zlib.adler32(bytes(out[12:])) & 0xffffffff  # checksum 覆盖 [12:]
+    out[8:12] = le32(new_checksum)
+
     with open(os.path.join(stCurrentPt, 'classes.dex'), 'wb') as f:
-        f.write(bytes(liAllDt))
+        f.write(bytes(out))
+    print("[*] 已隐藏 {} 个原始 DEX 到壳 DEX 尾部".format(len(srcDexBytesList)))
 
 
-def intToSmalEndian(numb):
-    liRes = []
+STUB_APPLICATION = "cn.yongye.nativeshell.StubApp"
 
-    stHexNumb = hex(numb)[2:]
-    for i in range(8 - len(stHexNumb)):
-        stHexNumb = '0' + stHexNumb
-    liRes = re.findall(r'.{2}', stHexNumb)
-    for i in range(len(liRes)):
-        liRes[i] = ord(bytes.fromhex(liRes[i]))
-    liRes.reverse()
 
-    return liRes
+def read_manifest_bytes(apk_path):
+    with zipfile.ZipFile(apk_path) as z:
+        return z.read('AndroidManifest.xml')
 
-def decompAPK(fp):
-    cmd = []
-    cmd.append('java')
-    cmd.append('-jar')
-    cmd.append(stApkToolPt)
-    cmd.append('d')
-    cmd.append('-o')
-    cmd.append(fp + "decompile")
-    cmd.append(fp)
-    check_call(cmd)
- 
+
 def getAppName(fp):
-    stAppName = "android.app.Application"
-    stDisassembleDp = fp + "decompile"
-    stAMFp = os.path.join(stDisassembleDp, "AndroidManifest.xml")
-    oDomTree = parse(stAMFp)
-    manifest = oDomTree.documentElement
-    apps = manifest.getElementsByTagName('application')
+    """直接解析二进制 AndroidManifest.xml，读取原 <application android:name>。"""
+    try:
+        ax = AXML(read_manifest_bytes(fp))
+        name = ax.get_application_name()
+    except Exception as e:
+        print("[!] 解析 manifest 失败，退回默认 Application: {}".format(e))
+        name = None
+    return name if name else "android.app.Application"
 
-    if len(apps) != 1:
-        print("存在多个Application")
-        raise(Exception)
-    if apps[0].getAttribute("android:name") != "":
-        stAppName = apps[0].getAttribute("android:name")
-    
-    return stAppName
-    
-def replaceTag(fp, stValue):
-    stAXMLFp = os.path.join(stCurrentPt, fp + "decompile", "AndroidManifest.xml")
-    dom = None
-    with open(stAXMLFp, 'r', encoding='UTF-8') as f:
-        dom = parse(f)
-    root = dom.documentElement
-    app = root.getElementsByTagName('application')[0]
-    app.setAttribute("android:name", stValue)
-    with open(stAXMLFp, "w", encoding='UTF-8') as f:
-        dom.writexml(f, encoding='UTF-8')
-    stDecompDp = os.path.join(stCurrentPt, fp + "decompile")
-    # 修复PNG文件BUG
 
-    PngBug(stDecompDp)
-    cmd = []
-    cmd.append('java')
-    cmd.append('-jar')
-    cmd.append(stApkToolPt)
-    cmd.append('b')
-    cmd.append('-o')
-    cmd.append("result.apk")
-    cmd.append(stDecompDp)
-    check_call(cmd) 
-
-    shutil.rmtree(stDecompDp)
+def patch_manifest_bytes(manifest_bytes):
+    """把 <application android:name> 改/插为壳 StubApp，返回新的 AXML 字节。"""
+    ax = AXML(manifest_bytes)
+    old = ax.set_application_name(STUB_APPLICATION)
+    print("[*] manifest application: {} -> {}".format(old or "(无)", STUB_APPLICATION))
+    return ax.to_bytes()
 
 
 def save_appName(appName):
@@ -147,109 +119,143 @@ def save_appName(appName):
         f.write("    public static final String MAIN_APPLICATION = \"{}\";\n".format(appName))
         f.write("}")
 
-def compileSrcApk(dp):
-    cmd = []
-    cmd.append('java')
-    cmd.append('-jar')
-    cmd.append(stApkToolPt)
-    cmd.append('b')
-    cmd.append('-f')
-    cmd.append('-o')
-    cmd.append(stCurrentPt + "\src.apk")
-    cmd.append(dp)
-    check_call(cmd)
-
 def compileShellDex():
+    # 跨平台实现：用 glob 显式展开 .java（javac/dx 本身不展开通配符），
+    # 并用独立构建目录，最后把整个 .class 目录树交给 dx（dx 支持目录输入）。
+    build_dir = os.path.join(stCurrentPt, "shell_build")
+    shutil.rmtree(build_dir, ignore_errors=True)
+    os.makedirs(build_dir)
 
-    licmd2 = []
-    licmd2.append("javac")
-    licmd2.append("-encoding")
-    licmd2.append("UTF-8")
-    licmd2.append("-target")
-    licmd2.append("1.8")
-    licmd2.append("-bootclasspath")
-    licmd2.append(stAndroidJarlibPt)
-    licmd2.append("-d")
-    licmd2.append(stCurrentPt)
-    licmd2.append(stCurrentPt + r"\shellApplicationSourceCode\java\cn\yongye\nativeshell\*.java")
-    licmd2.append(stCurrentPt + r"\shellApplicationSourceCode\java\cn\yongye\nativeshell\common\*.java")
-    licmd2.append(stCurrentPt + r"\shellApplicationSourceCode\java\cn\yongye\nativeshell\inmemoryloaddex\*.java")
+    java_src_root = os.path.join(stShellAppPt, "java")
+    java_files = glob.glob(os.path.join(java_src_root, "**", "*.java"), recursive=True)
+    if not java_files:
+        raise Exception("未找到壳源码 .java 文件，检查 SHELL_APP_DIR: " + stShellAppPt)
+
+    licmd2 = ["javac", "-encoding", "UTF-8",
+              "-source", "1.8", "-target", "1.8",
+              "-bootclasspath", stAndroidJarlibPt,
+              "-d", build_dir] + java_files
     check_call(licmd2)
 
-    licmd3 = []
-    licmd3.append("java")
-    licmd3.append("-jar")
-    licmd3.append(stdxJarPt)
-    licmd3.append("--dex")
-    licmd3.append("--output=" + stCurrentPt + "\shell.dex")
-    licmd3.append(r"cn\yongye\nativeshell\*.class")
-    licmd3.append(r"cn\yongye\nativeshell\common\*.class")
-    licmd3.append(r"cn\yongye\nativeshell\inmemoryloaddex\*.class")
+    licmd3 = ["java", "-jar", stdxJarPt,
+              "--dex", "--output=" + os.path.join(stCurrentPt, "shell.dex"),
+              build_dir]
     check_call(licmd3)
 
-    shutil.rmtree("cn")
+    shutil.rmtree(build_dir, ignore_errors=True)
     
     
-def replaceSDexToShellDex(stSApkFp):
-    # 提取原APK中的DEX到本地
-    oFApk = zipfile.ZipFile(stSApkFp)
-    oFApk.extract("classes.dex", stCurrentPt)
-    oFApk.close()
-    stSDexFp = os.path.join(stCurrentPt, "classes.dex")
-    stShellDexFp = os.path.join(stCurrentPt, "shell.dex")
-    # 将原DEX添加到壳DEX尾部，保存到本目录下为classes.dex
-    add_srcDexToShellDex(stSDexFp, stShellDexFp)
-    #将修改后的壳DEX添加到原DEX中
+def collect_src_dexes(apk_path):
+    """收集原 APK 的全部 classes*.dex（多 dex），按 classes.dex, classes2.dex ... 顺序。"""
+    with zipfile.ZipFile(apk_path) as z:
+        dexNames = [n for n in z.namelist() if re.match(r'^classes\d*\.dex$', n)]
 
-    cmd1 = []
-    cmd1.append(staaptPt)
-    cmd1.append("r")
-    cmd1.append(stSApkFp)
-    cmd1.append("classes.dex")
-    check_call(cmd1)
+        def order(name):
+            m = re.match(r'^classes(\d*)\.dex$', name)
+            return 1 if m.group(1) == '' else int(m.group(1))
+        dexNames.sort(key=order)
+        data = {n: z.read(n) for n in dexNames}
+    print("[*] 检测到原 APK 的 DEX: {}".format(dexNames))
+    return dexNames, [data[n] for n in dexNames]
 
-    oNewApk = zipfile.ZipFile(stSApkFp, "a")
-    oNewApk.write("classes.dex", "classes.dex")
-    oNewApk.close()
 
-    os.remove(stSDexFp)
-    os.remove(stShellDexFp)
+def add_native_libs(zout):
+    """把脱壳 native 库按 ABI 目录写入（STORED 未压缩，便于 zipalign 对齐）。
+
+    仅 Android 5.0~7.1 (API 21~25) 会用到；8.0+ 走 Java InMemoryDexClassLoader，无 native 依赖。
+    需为各 ABI 用 NDK 编译出 libdalvik_system_DexFile.so 放到 lib/<abi>/ 下（cpp/build.sh）。
+    """
+    written = 0
+    for abi in TARGET_ABIS:
+        soPath = os.path.join(stCurrentPt, "lib", abi, "libdalvik_system_DexFile.so")
+        if os.path.isfile(soPath):
+            zi = zipfile.ZipInfo("lib/{}/libdalvik_system_DexFile.so".format(abi))
+            zi.compress_type = zipfile.ZIP_STORED
+            with open(soPath, "rb") as f:
+                zout.writestr(zi, f.read())
+            written += 1
+            print("[*] 打入 native 库: lib/{}/".format(abi))
+    if written == 0:
+        print("[!] 未找到任何 lib/<abi>/libdalvik_system_DexFile.so；"
+              "Android 8+ 不受影响，但 5.0~7.1 机型将无 native 回退。"
+              "如需覆盖老机型，请先运行 cpp/build.sh 编译 so。")
+
+
+def build_result_apk(src_apk, out_apk, shell_dex_path):
+    """
+    不反编译、不重编资源，直接基于原 APK 重组生成加固包：
+      - 替换 AndroidManifest.xml 为 patched（application -> StubApp）
+      - 丢弃全部原始 classes*.dex，写入壳 classes.dex
+      - 追加各 ABI 的脱壳 so
+      - 删除旧签名（META-INF/*.SF/.RSA/.DSA/.EC/MANIFEST.MF）
+    其余条目（resources.arsc、res/、assets/、原 lib/ 等）原样拷贝并保留压缩方式。
+    """
+    sig_re = re.compile(r'^META-INF/.*\.(RSA|DSA|EC|SF)$', re.I)
+    dex_re = re.compile(r'^classes\d*\.dex$')
+
+    with zipfile.ZipFile(src_apk) as zin:
+        patched_manifest = patch_manifest_bytes(zin.read('AndroidManifest.xml'))
+        with zipfile.ZipFile(out_apk, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                nm = item.filename
+                if nm == 'AndroidManifest.xml' or dex_re.match(nm):
+                    continue
+                if nm == 'META-INF/MANIFEST.MF' or sig_re.match(nm):
+                    continue
+                zi = zipfile.ZipInfo(nm, date_time=item.date_time)
+                zi.compress_type = item.compress_type      # 保留原压缩方式（resources.arsc 保持 STORED）
+                zi.external_attr = item.external_attr
+                zi.internal_attr = item.internal_attr
+                zi.create_system = item.create_system
+                zout.writestr(zi, zin.read(nm))
+
+            # patched manifest
+            mi = zipfile.ZipInfo('AndroidManifest.xml')
+            mi.compress_type = zipfile.ZIP_DEFLATED
+            zout.writestr(mi, patched_manifest)
+
+            # 壳 classes.dex（内含全部原始 dex 密文）
+            di = zipfile.ZipInfo('classes.dex')
+            di.compress_type = zipfile.ZIP_DEFLATED
+            with open(shell_dex_path, 'rb') as f:
+                zout.writestr(di, f.read())
+
+            # 各 ABI 脱壳 so
+            add_native_libs(zout)
+    print("[*] 已生成未对齐加固包: {}".format(out_apk))
+
+
+def zipalignApk(src, dst):
+    # -p 让 so 按页对齐；-f 覆盖；4 字节对齐
+    check_call([stZipalignPt, "-p", "-f", "4", src, dst])
+    print("[*] zipalign 完成: {}".format(dst))
 
 
 def signApk(fp, stKeystoreFp):
-    cmd = []
-    cmd.append("java")
-    cmd.append("-jar")
-    cmd.append(stApksignJarPt)
-    cmd.append("sign")
-    cmd.append("--ks")
-    cmd.append(stKeystoreFp)
-    cmd.append("--ks-pass")
-    cmd.append("pass:123456")
-    cmd.append(fp)
+    cmd = ["java", "-jar", stApksignJarPt, "sign",
+           "--ks", stKeystoreFp, "--ks-pass", "pass:123456", fp]
     check_call(cmd)
 
+def check_tools():
+    """启动前校验外部工具路径，避免回退到默认路径后抛出隐晦错误。"""
+    required = [
+        ('ANDROID_JAR', stAndroidJarlibPt),
+        ('DX_JAR', stdxJarPt),
+        ('APKSIGNER_JAR', stApksignJarPt),
+        ('ZIPALIGN', stZipalignPt),
+    ]
+    missing = [(env, p) for env, p in required if not p or not os.path.isfile(p)]
+    if missing:
+        print("[x] 以下工具路径无效，请先 `source env.sh` 或设置对应环境变量：")
+        for env, p in missing:
+            print("      {:<14} = {}".format(env, p if p else "(未设置)"))
+        print("    提示：运行 ./setup_test_env.sh 会自动探测并生成 env.sh，然后 `source env.sh` 再重试。")
+        raise SystemExit(1)
+    if not os.path.isfile(os.path.join(stShellAppPt, "java", "cn", "yongye",
+                                       "nativeshell", "StubApp.java")):
+        print("[x] 找不到壳源码，请检查 SHELL_APP_DIR: {}".format(stShellAppPt))
+        raise SystemExit(1)
 
-def PngBug(decompFp):
-    import filetype
-    liFiles = os.listdir(decompFp)
-    for fn in liFiles:
-        fp = os.path.join(decompFp, fn)
-        if os.path.isdir(fp):
-            PngBug(fp)   
-        if fp.endswith(".png") and filetype.guess(fp).MIME == "image/gif":
-            im = Image.open(fp)
-            current = im.tell()
-            im.save(fp)
-
-def addLib(fp):
-    stLib2Fp1 = os.path.join(stCurrentPt, "lib", "libdalvik_system_DexFile.so")
-    stLib2Fp2 = os.path.join(stCurrentPt, "lib", "libyongyejiagu.so")
-
-    apk = zipfile.ZipFile(fp, "a")
-    apk.write(stLib2Fp1, "lib/x86/libdalvik_system_DexFile.so")
-    apk.write(stLib2Fp2, "lib/x86/libyongyejiagu.so")
-    apk.close()
 
 if __name__ == "__main__":
 
@@ -259,51 +265,48 @@ if __name__ == "__main__":
 
     if args.f:
         fp = args.__dict__.get('f')[0]
-        """
-        1. 第一步：确定加密算法
-        """
-        inKey = 0xFF
-        print("[*] 确定加密解密算法，异或: {}".format(str(inKey)))
 
-        """
-        2. 第二步：准备好壳App
-        """
-        # 反编译原apk
-        decompAPK(fp)
-        # print("[*] 反编译原的apk文件{}完成".format(fp))
-        # 获取Applicaiton name并保存到壳App源码中
+        # 预检外部工具，缺失则给出清晰提示
+        check_tools()
+        if not os.path.isfile(fp):
+            print("[x] APK 不存在: {}".format(fp)); raise SystemExit(1)
+
+        shell_dex = os.path.join(stCurrentPt, "shell.dex")
+        packed_dex = os.path.join(stCurrentPt, "classes.dex")   # 内嵌进结果包的壳 classes.dex
+        unaligned = os.path.join(stCurrentPt, "result_unaligned.apk")
+        result = os.path.join(stCurrentPt, "result.apk")
+
+        print("[*] 加密算法：异或 0x{:02X}".format(INKEY))
+
+        # 1. 读取原 Application 名并写入壳 Config（直接解析二进制 manifest，无需 apktool）
         stSrcDexAppName = getAppName(fp)
-        # print("[*] 获取原apk文件的Application Android:name=\"{}\" 完成".format(stSrcDexAppName))
+        print("[*] 原 Application: {}".format(stSrcDexAppName))
         save_appName(stSrcDexAppName)
-        # print("[*] 保存原apk文件的Application Android:name=\"{}\" 到壳App源码的配置文件完成".format(stSrcDexAppName))
-        # 编译出壳DEX
+
+        # 2. 编译壳 DEX
         compileShellDex()
-        print("[*] 壳App的class字节码文件编译为:shell.dex完成")
+        print("[*] 壳 DEX 编译完成")
 
-        """
-        3. 第三步：修改原apk AndroidManifest.xml文件中的Application name字段为壳的Application name字段
-        """
-        # 替换壳Applicaiton name到原apk的AndroidManifest.xml内
-        replaceTag(fp, "cn.yongye.nativeshell.StubApp")
-        print("[*] 原apk文件AndroidManifest.xml中application的name字段替换为壳application name字段完成")
-        
-        """
-        4. 替换原apk中的DEX文件为壳DEX
-        """
-        replaceSDexToShellDex(os.path.join(stCurrentPt, "result.apk"))
-        print("[*] 壳DEX替换原apk包内的DEX文件完成")
+        # 3. 收集原 APK 全部 dex，加密隐藏到壳 DEX 尾部 -> classes.dex
+        _dexNames, srcDexList = collect_src_dexes(fp)
+        build_shell_dex_with_payloads(shell_dex, srcDexList)
 
-        """
-        5. 添加脱壳lib库到原apk中
-        """
-        addLib("result.apk")
-        
-        """
-        6. apk签名
-        """
-        signApk(os.path.join(stCurrentPt, "result.apk"), os.path.join(stCurrentPt, "demo.keystore"))
-        print("[*] 签名完成，生成apk文件: {}".format(os.path.join(stCurrentPt, "result.apk")))
-        
+        # 4. 无资源重编，直接重组 APK（换 manifest、换 dex、加 so、去旧签名）
+        build_result_apk(fp, unaligned, packed_dex)
+
+        # 5. 对齐
+        zipalignApk(unaligned, result)
+
+        # 6. 签名
+        signApk(result, os.path.join(stCurrentPt, "demo.keystore"))
+        print("[*] 签名完成 ✅ 生成: {}".format(result))
+
+        # 清理中间产物
+        for p in (shell_dex, packed_dex, unaligned):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     else:
         parser.print_help()

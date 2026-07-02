@@ -1,0 +1,28 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== 加固中间产物 / 输出包 =====
+result.apk
+result.apk.idsig
+result_unaligned.apk
+classes.dex
+shell.dex
+src.apk
+shell_build/
+
+# ===== 旧 apktool 流程的反编译残留（v3 已弃用）=====
+*.apkdecompile/
+
+# ===== NDK / ndk-build 构建中间产物 =====
+cpp/libs/
+cpp/obj/
+
+# ===== setup 脚本生成的环境文件 =====
+env.sh
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
