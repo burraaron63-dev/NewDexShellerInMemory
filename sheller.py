@@ -162,7 +162,7 @@ def collect_src_dexes(apk_path):
 def add_native_libs(zout):
     """把脱壳 native 库按 ABI 目录写入（STORED 未压缩，便于 zipalign 对齐）。
 
-    仅 Android 5.0~7.1 (API 21~25) 会用到；8.0+ 走 Java InMemoryDexClassLoader，无 native 依赖。
+    仅 Android 5.0~5.1 (API 21~22) 会用到；6.0~7.1 无内存脱壳方案，8.0+ 走 Java InMemoryDexClassLoader。
     需为各 ABI 用 NDK 编译出 libdalvik_system_DexFile.so 放到 lib/<abi>/ 下（cpp/build.sh）。
     """
     written = 0
@@ -177,7 +177,7 @@ def add_native_libs(zout):
             print("[*] 打入 native 库: lib/{}/".format(abi))
     if written == 0:
         print("[!] 未找到任何 lib/<abi>/libdalvik_system_DexFile.so；"
-              "Android 8+ 不受影响，但 5.0~7.1 机型将无 native 回退。"
+              "Android 8+ 不受影响，但 5.0/5.1 机型将无 native 回退。"
               "如需覆盖老机型，请先运行 cpp/build.sh 编译 so。")
 
 

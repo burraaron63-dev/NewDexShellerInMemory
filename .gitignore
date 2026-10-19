@@ -26,3 +26,11 @@ env.sh
 # ===== 系统 =====
 .DS_Store
 Thumbs.db
+
+# ===== demo 构建产物 =====
+demo/build/
+demo/demo.apk
+demo/*.idsig
+
+# ===== OMC 会话状态 =====
+.omc/

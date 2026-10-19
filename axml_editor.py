@@ -290,7 +290,7 @@ class AXML:
 
 # ---------------- 自测 ----------------
 if __name__ == '__main__':
-    import sys
+    import sys, os, tempfile
     data = open(sys.argv[1], 'rb').read()
     ax = AXML(data)
     print("字符串数:", len(ax.strings))
@@ -298,7 +298,8 @@ if __name__ == '__main__':
     old = ax.set_application_name('cn.yongye.nativeshell.StubApp')
     print("set 返回原名:", old)
     out = ax.to_bytes()
-    open('/tmp/axtest/out.xml', 'wb').write(out)
+    out_path = os.path.join(tempfile.gettempdir(), 'axml_editor_selftest.xml')
+    open(out_path, 'wb').write(out)
     # round-trip 校验：重新解析，确认 application name 已改
     ax2 = AXML(out)
     got = ax2.get_application_name()

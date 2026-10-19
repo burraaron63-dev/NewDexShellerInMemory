@@ -4,12 +4,9 @@ import android.content.Context;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -64,38 +61,6 @@ public class FileUtils {
         }
         localZipInputStream.close();
         return dexByteArrayOutputStream.toByteArray();
-    }
-
-    /**
-     * 将原DEX从壳DEX上分离出来
-     * @param stDexPt
-     * @param apkdata   壳DEX数据
-     * @throws IOException
-     */
-    public static void splitPayLoadFromDex(String stDexPt, byte[] apkdata) throws IOException {
-        String TAG = "yongye";
-        apkdata = decrypt(apkdata);
-        int ablen = apkdata.length;
-        byte[] dexlen = new byte[4];
-        System.arraycopy(apkdata, ablen - 4, dexlen, 0, 4);
-        ByteArrayInputStream bais = new ByteArrayInputStream(dexlen);
-        DataInputStream in = new DataInputStream(bais);
-        int readInt = in.readInt();
-        Log.i(TAG, "原始DEX长度：" + String.valueOf(readInt));
-        byte[] newdex = new byte[readInt];
-        System.arraycopy(apkdata, ablen - 4 - readInt, newdex, 0, readInt);
-        File file = new File(stDexPt);
-        if(file.exists()){
-            Log.i(TAG, file.getAbsolutePath() + "文件还存在");
-        }
-        try {
-            FileOutputStream localFileOutputStream = new FileOutputStream(file);
-            localFileOutputStream.write(newdex);
-            localFileOutputStream.close();
-        } catch (IOException localIOException) {
-            Log.e(TAG, "dump 原始DEX失败");
-            throw new RuntimeException(localIOException);
-        }
     }
 
     private static byte[] decrypt(byte[] baEncryted){

@@ -5,6 +5,7 @@ import android.content.Context;
 import android.os.Build;
 import android.util.Log;
 
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -22,8 +23,11 @@ import cn.yongye.nativeshell.inmemoryloaddex.MyDexClassLoader;
  *
  *   - API 26+ (Android 8.0+)：使用系统公开的 dalvik.system.InMemoryDexClassLoader，
  *     官方支持、无需 native hack，一直到 Android 14+ 均可用。
- *   - API 21~25 (Android 5.0~7.1)：InMemoryDexClassLoader 不存在，回退到 native
+ *   - API 21~22 (Android 5.0~5.1)：InMemoryDexClassLoader 不存在，回退到 native
  *     OpenMemory 方案（MyDexClassLoader + libdalvik_system_DexFile.so）。
+ *   - API 23~25 (Android 6.0~7.1)：没有可用的内存脱壳方案——native 的 vector+long
+ *     cookie 与 6.0+ 的 Object(long[])/5 参 defineClass 不兼容，InMemoryDexClassLoader
+ *     又要到 8.0 才有。此区间会明确告警并加载失败（如需覆盖需另实现落盘 DexClassLoader）。
  *
  * 相比旧版把加载流程写死在 native 层（只适配 Android 5.x + x86 + 32 位），此设计天然覆盖
  * 绝大多数在网设备，并把仅剩的 native 依赖限制在少数老旧机型上。
@@ -89,16 +93,32 @@ public class StubApp extends Application {
                     Constructor<?> ctor = cls.getConstructor(ByteBuffer[].class, ClassLoader.class);
                     return (ClassLoader) ctor.newInstance(buffers, parent);
                 } else {
-                    // API 26~28 只有单 ByteBuffer 构造，多 dex 通过链式父子关系串起来
+                    // API 26~28 只有单 ByteBuffer 公开构造。若用链式父子关系串联多个 dex，
+                    // 父优先委派会让先加载的 dex 看不到后加载 dex 的类（多 dex 互相引用必崩）。
+                    // 故改为把每个 dex 的 dexElements 合并进同一个 ClassLoader 的 pathList
+                    // （Android multidex 的标准做法），使所有 dex 在同一命名空间内互相可见。
                     Constructor<?> ctor = cls.getConstructor(ByteBuffer.class, ClassLoader.class);
-                    ClassLoader cl = parent;
-                    for (ByteBuffer buf : buffers) {
-                        cl = (ClassLoader) ctor.newInstance(buf, cl);
+                    ClassLoader first = (ClassLoader) ctor.newInstance(buffers[0], parent);
+                    if (buffers.length == 1) {
+                        return first;
                     }
-                    return cl;
+                    Object firstPathList = getField(first, "pathList");           // BaseDexClassLoader.pathList
+                    Object merged = getField(firstPathList, "dexElements");        // DexPathList.Element[]
+                    for (int i = 1; i < buffers.length; i++) {
+                        ClassLoader next = (ClassLoader) ctor.newInstance(buffers[i], parent);
+                        Object nextElements = getField(getField(next, "pathList"), "dexElements");
+                        merged = concatArray(merged, nextElements);
+                    }
+                    setField(firstPathList, "dexElements", merged);
+                    Log.i(TAG, "已合并 " + buffers.length + " 个 dex 的 dexElements");
+                    return first;
                 }
             } else {
-                // Android 5.0~7.1：native OpenMemory 回退路径
+                // Android 5.0/5.1 (API 21~22)：native OpenMemory 回退路径（唯一可用的 native 内存加载区间）
+                if (sdk >= 23) {
+                    Log.w(TAG, "API " + sdk + " (6.0~7.1) 无内存脱壳方案：native 仅支持 5.0/5.1、"
+                            + "InMemoryDexClassLoader 需 8.0+，该机型将无法加载原始 DEX");
+                }
                 return new MyDexClassLoader(buffers, parent);
             }
         } catch (Throwable t) {
@@ -179,6 +199,16 @@ public class StubApp extends Application {
         Field f = findField(obj.getClass(), name);
         f.setAccessible(true);
         f.set(obj, value);
+    }
+
+    /** 合并两个同类型数组，用于拼接各 InMemoryDexClassLoader 的 dexElements */
+    private static Object concatArray(Object a, Object b) {
+        int la = Array.getLength(a);
+        int lb = Array.getLength(b);
+        Object merged = Array.newInstance(a.getClass().getComponentType(), la + lb);
+        System.arraycopy(a, 0, merged, 0, la);
+        System.arraycopy(b, 0, merged, 0, lb);
+        return merged;
     }
 
     /** 沿父类链查找字段，兼容不同 Android 版本字段所在的类层级 */

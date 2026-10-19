@@ -33,7 +33,8 @@ v2 仍沿用「apktool 反编译 → 改 manifest → apktool 重新编译」的
 | Android 版本 | API | 加载方式 | 是否需要 native so |
 | --- | --- | --- | --- |
 | 8.0 ~ 14+ | 26+ | 官方 `InMemoryDexClassLoader`（`ByteBuffer[]` / 链式） | 否 |
-| 5.0 ~ 7.1 | 21~25 | native `OpenMemory` 回退（`MyDexClassLoader`） | 是 |
+| 5.0 ~ 5.1 | 21~22 | native `OpenMemory` 回退（`MyDexClassLoader`） | 是 |
+| 6.0 ~ 7.1 | 23~25 | 不支持（cookie/`defineClass` ABI 与 native 方案不兼容） | - |
 | < 5.0 | <21 | 不支持（Dalvik，占比极低） | - |
 
 因此绝大多数在网设备（Android 8+）走官方 API，天然稳定；native 仅作为老机型回退。
@@ -45,7 +46,7 @@ v2 仍沿用「apktool 反编译 → 改 manifest → apktool 重新编译」的
 - **硬编码测试类**：native 旧代码写死加载 `com.h.MyAdmin`，任何真实 APK 必崩，已删除。
 - **64 位机型崩溃**：native 旧代码 ELF 解析写死 `Elf32`、库路径写死 `/system/lib`。
   现按 `__LP64__` 选择 `Elf64` 与 `/system/lib64/libart.so`。
-- **单一版本符号**：`OpenMemory` 符号仅 5.x 可用。现用符号候选表在 5.0~7.1 间自适应。
+- **单一版本符号**：`OpenMemory` 符号仅 5.x 可用。符号候选表覆盖 5.0/5.1 多个变体；注意 6.0+ 即便命中符号，其 cookie/`defineClass` ABI 也已不兼容，故 native 实际只支持 5.0/5.1。
 - **进程被静默杀死**：失败处 `exit(0)` 改为记录日志并优雅返回，交由 Java 兜底。
 - **多 dex 丢失**：旧版只加固 `classes.dex`。现加固全部 `classes*.dex`（多 dex 应用不再漏保护）。
 - **工具路径不可移植**：`sheller.py` 中 `D:\...` 路径改为可用环境变量覆盖。
@@ -60,7 +61,7 @@ cd cpp
 NDK=/path/to/android-ndk ./build.sh        # Windows 用 build.bat，先 set NDK=...
 ```
 
-> 提示：API 21~25 的 native `OpenMemory` 回退路径依赖各 ROM 的 libart 符号，属尽力而为，
+> 提示：API 21~22（5.0/5.1）的 native `OpenMemory` 回退路径依赖各 ROM 的 libart 符号，属尽力而为，
 > 建议在目标老机型上实测；Android 8.0+ 无此依赖。**Android 10+ 已由 `InMemoryDexClassLoader`
 > 覆盖，无需 native。**
 

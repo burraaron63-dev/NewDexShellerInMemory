@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.4.1)
 # You can define multiple libraries, and CMake builds them for you.
 # Gradle automatically packages shared libraries with your APK.
 
-# 仅在 Android 5.0~7.1 (API 21~25) 需要该 native 库；8.0+ 走 Java InMemoryDexClassLoader。
+# 仅在 Android 5.0~5.1 (API 21~22) 需要该 native 库（6.0~7.1 的 cookie/defineClass ABI 不兼容）；8.0+ 走 Java InMemoryDexClassLoader。
 # yongyejiagu.cpp 已废弃（编排迁至 Java StubApp），不再编译。
 add_library( # Sets the name of the library.
         dalvik_system_DexFile
