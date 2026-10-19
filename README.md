@@ -1,4 +1,4 @@
-> 📖 中文文档: [README.md](README.md)
+**English** | [中文](README_CN.md)
 
 # dexshellerInMemory
 

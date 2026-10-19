@@ -1,4 +1,4 @@
-> 📖 English documentation: [README.en.md](README.en.md)
+[English](README.md) | **中文**
 
 # 概况
 
