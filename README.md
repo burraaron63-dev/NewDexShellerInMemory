@@ -1,3 +1,5 @@
+> 📖 English documentation: [README.en.md](README.en.md)
+
 # 概况
 
 本文目的：通过**内存加载DEX文件技术**，完成**一键DEX加固脚本**
@@ -256,9 +258,3 @@ D:\Android\Sdk\cmake\3.10.2.4988404\bin\ninja.exe
 【1】[Android中apk加固完善篇之内存加载dex方案实现原理(不落地方式加载)](http://www.520monkey.com/archives/629)
 
 【2】[内存解密并加载DEX](https://github.com/woxihuannisja/Bangcle)
-
-# 鼓励
-
-![支付宝](/images/zfb.png)
-
-![微信](/images/wx.png)
